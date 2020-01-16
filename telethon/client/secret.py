@@ -1,4 +1,6 @@
+import os
 import random
+import struct
 from hashlib import sha1, sha256
 from time import time
 

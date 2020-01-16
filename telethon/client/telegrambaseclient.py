@@ -366,8 +366,7 @@ class TelegramBaseClient(abc.ABC):
         self.temp_secret_chat = {}
         self.secret_chats = {}
         self.dh_config = None
-
-
+        self.temp_rekeyed_secret_chats = {}
 
     # endregion
 
