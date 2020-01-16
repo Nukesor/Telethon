@@ -6,7 +6,7 @@ from time import time
 
 import typing
 
-from .. import utils, helpers, hints
+from .. import utils, hints
 from ..crypto import AES
 from ..errors import SecurityError, EncryptionAlreadyDeclinedError
 from ..extensions import BinaryReader
@@ -50,39 +50,34 @@ class Chats:
         self.rekeying = [0]
         self.mtproto = 1
 
+    def as_input(self):
+        return types.InputEncryptedChat(self.id, self.access_hash)
+
 
 class SecretChatMethods:
 
-    def get_secret_chat(self: 'TelegramClient', chat_id: 'typing.Union[Chats, hints.EntityLike]') -> Chats:
-        if isinstance(chat_id, int):
-            peer = self.secret_chats.get(chat_id, None)
-            if not peer:
-                raise ValueError("chat not found")
-            return peer
+    def get_secret_chat(self: 'TelegramClient', chat: 'typing.Union[Chats, hints.EntityLike]') -> Chats:
+        if isinstance(chat, Chats):
+            chat_id = chat.id
+        else:
+            chat_id = utils.get_peer_id(chat, add_mark=False)
+
         try:
-            peer = self.secret_chats.get(chat_id.id, None)
-            if not peer:
-                raise ValueError("chat not found")
-            return peer
-        except AttributeError:
-            pass
-        try:
-            peer = self.secret_chats.get(chat_id.chat_id, None)
-            if not peer:
-                raise ValueError("chat not found")
-            return peer
-        except AttributeError:
-            pass
-        raise ValueError("chat not found")
+            return self.secret_chats[chat_id]
+        except KeyError:
+            raise ValueError('Secret chat for {} not found'.format(chat))
 
     async def get_dh_config(self: 'TelegramClient'):
         version = 0 if not self.dh_config else self.dh_config.version
         dh_config = await self(functions.messages.GetDhConfigRequest(random_length=0, version=version))
         if isinstance(dh_config, types.messages.DhConfigNotModified):
             return self.dh_config
-        dh_config.p = int.from_bytes(dh_config.p, 'big', signed=False)
-        self.dh_config = dh_config
-        return dh_config
+        elif isinstance(dh_config, types.messages.DhConfig):
+            dh_config.p = int.from_bytes(dh_config.p, 'big', signed=False)
+            self.dh_config = dh_config
+            return dh_config
+        else:
+            raise TypeError('Unknown dh_config type: {}'.format(dh_config))
 
     def check_g_a(self: 'TelegramClient', g_a: int, p: int) -> bool:
         if g_a <= 1 or g_a >= p - 1:
@@ -97,7 +92,10 @@ class SecretChatMethods:
         a = int.from_bytes(os.urandom(256), 'big', signed=False)
         g_a = pow(dh_config.g, a, dh_config.p)
         self.check_g_a(g_a, dh_config.p)
-        res = await self(functions.messages.RequestEncryptionRequest(user_id=peer, g_a=g_a.to_bytes(256, 'big', signed=False)))
+        res = await self(functions.messages.RequestEncryptionRequest(
+            user_id=peer,
+            g_a=g_a.to_bytes(256, 'big', signed=False)
+        ))
         self.temp_secret_chat[res.id] = a
         return res.id
 
@@ -117,12 +115,14 @@ class SecretChatMethods:
         e = random.randint(10000000, 99999999)
         self.temp_rekeyed_secret_chats[e] = a
         peer.rekeying = [1, e]
-        message = types.secret.DecryptedMessageService(action=types.secret.DecryptedMessageActionRequestKey(
-            g_a=g_a.to_bytes(256, 'big', signed=False),
-            exchange_id=e,
-        ))
+        message = types.secret.DecryptedMessageService(
+            action=types.secret.DecryptedMessageActionRequestKey(
+                g_a=g_a.to_bytes(256, 'big', signed=False),
+                exchange_id=e,
+            )
+        )
         message = await self.encrypt_secret_message(peer, message)
-        await self(functions.messages.SendEncryptedServiceRequest(types.InputEncryptedChat(peer.id, peer.access_hash), message))
+        await self(functions.messages.SendEncryptedServiceRequest(peer.as_input(), message))
 
         return e
 
@@ -136,6 +136,7 @@ class SecretChatMethods:
             if my_exchange_id == other_exchange_id:
                 peer.rekeying = [0]
                 return
+
         self._log.debug(f'Accepting rekeying secret chat {peer}')
         dh_config = await self.get_dh_config()
         random_bytes = os.urandom(256)
@@ -150,19 +151,22 @@ class SecretChatMethods:
         peer.rekeying = [2, action.exchange_id]
         g_b = pow(dh_config.g, b, dh_config.p)
         self.check_g_a(g_b, dh_config.p)
-        message = types.secret.DecryptedMessageService(action=types.secret.DecryptedMessageActionAcceptKey(
-            g_b=g_b.to_bytes(256, 'big', signed=False),
-            exchange_id=action.exchange_id,
-            key_fingerprint=key.fingerprint
-        ))
+        message = types.secret.DecryptedMessageService(
+            action=types.secret.DecryptedMessageActionAcceptKey(
+                g_b=g_b.to_bytes(256, 'big', signed=False),
+                exchange_id=action.exchange_id,
+                key_fingerprint=key.fingerprint
+            )
+        )
         message = await self.encrypt_secret_message(peer, message)
-        await self(functions.messages.SendEncryptedServiceRequest(types.InputEncryptedChat(peer.id, peer.access_hash), message))
+        await self(functions.messages.SendEncryptedServiceRequest(peer.as_input(), message))
 
     async def commit_rekey(self: 'TelegramClient', peer: Chats, action: types.secret.DecryptedMessageActionAcceptKey):
         peer = self.get_secret_chat(peer)
         if peer.rekeying[0] != 1 or not self.temp_rekeyed_secret_chats.get(action.exchange_id, None):
             peer.rekeying = [0]
             return
+
         self._log.debug(f'Committing rekeying secret chat {peer}')
         dh_config = await self.get_dh_config()
         g_b = int.from_bytes(action.g_b, 'big', signed=False)
@@ -171,19 +175,23 @@ class SecretChatMethods:
         auth_key = res.to_bytes(256, 'big', signed=False)
         key = ChatKey(auth_key)
         key.fingerprint = struct.unpack('<q', sha1(key.auth_key).digest()[-8:])[0]
+
         if key.fingerprint != action.key_fingerprint:
-            message = types.secret.DecryptedMessageService(action=types.secret.DecryptedMessageActionAbortKey(
-                exchange_id=action.exchange_id,
-            ))
+            message = types.secret.DecryptedMessageService(
+                action=types.secret.DecryptedMessageActionAbortKey(
+                    exchange_id=action.exchange_id,
+                )
+            )
             message = await self.encrypt_secret_message(peer, message)
-            await self(functions.messages.SendEncryptedServiceRequest(types.InputEncryptedChat(peer.id, peer.access_hash), message))
+            await self(functions.messages.SendEncryptedServiceRequest(peer.as_input(), message))
             raise SecurityError("Invalid Key fingerprint")
+
         message = types.secret.DecryptedMessageService(action=types.secret.DecryptedMessageActionCommitKey(
             exchange_id=action.exchange_id,
             key_fingerprint=key.fingerprint
         ))
         message = await self.encrypt_secret_message(peer, message)
-        await self(functions.messages.SendEncryptedServiceRequest(types.InputEncryptedChat(peer.id, peer.access_hash), message))
+        await self(functions.messages.SendEncryptedServiceRequest(peer.as_input(), message))
         del self.temp_rekeyed_secret_chats[action.exchange_id]
         peer.rekeying = [0]
         peer.key = key
@@ -194,12 +202,14 @@ class SecretChatMethods:
         peer = self.get_secret_chat(peer)
         if peer.rekeying[0] != 2 or self.temp_rekeyed_secret_chats.get(action.exchange_id, None):
             return
+
         if self.temp_rekeyed_secret_chats.get[action.exchange_id] != action.key_fingerprint:
             message = types.secret.DecryptedMessageService(action=types.secret.DecryptedMessageActionAbortKey(
                 exchange_id=action.exchange_id,
             ))
+
             message = await self.encrypt_secret_message(peer, message)
-            await self(functions.messages.SendEncryptedServiceRequest(types.InputEncryptedChat(peer.id, peer.access_hash), message))
+            await self(functions.messages.SendEncryptedServiceRequest(peer.as_input(), message))
             raise SecurityError("Invalid Key fingerprint")
 
         self._log.debug(f'Completing rekeying secret chat {peer}')
@@ -210,8 +220,8 @@ class SecretChatMethods:
         del self.temp_rekeyed_secret_chats[action.exchange_id]
         message = types.secret.DecryptedMessageService(action=types.secret.DecryptedMessageActionNoop())
         message = await self.encrypt_secret_message(peer, message)
-        await self(functions.messages.SendEncryptedServiceRequest(types.InputEncryptedChat(peer.id, peer.access_hash), message))
-        self._log.debug(f'Secret chat {peer} rekeyed succrsfully')
+        await self(functions.messages.SendEncryptedServiceRequest(peer.as_input(), message))
+        self._log.debug(f'Secret chat {peer} rekeyed successfully')
 
     async def handle_decrypted_message(self: 'TelegramClient', decrypted_message, peer: Chats):
         if isinstance(decrypted_message, (types.secret.DecryptedMessageService, types.secret.DecryptedMessageService8)):
@@ -265,6 +275,7 @@ class SecretChatMethods:
         if not self.secret_chats.get(event.message.chat_id):
             self._log.debug("Secret chat not saved. skipping")
             return False
+
         message = event.message
         auth_key_id = struct.unpack('<q', message.bytes[:8])[0]
         peer = self.get_secret_chat(message.chat_id)
@@ -279,7 +290,7 @@ class SecretChatMethods:
             try:
                 decrypted_message = self.decrypt_mtproto2(bytes.fromhex(message_key.hex()), message.chat_id,
                                                           bytes.fromhex(encrypted_data.hex()))
-            except Exception as e:
+            except Exception:
                 decrypted_message = self.decrypt_mtproto1(bytes.fromhex(message_key.hex()), message.chat_id,
                                                           bytes.fromhex(encrypted_data.hex()))
                 peer.mtproto = 1
@@ -290,14 +301,16 @@ class SecretChatMethods:
                 decrypted_message = self.decrypt_mtproto1(bytes.fromhex(message_key.hex()), message.chat_id,
                                                           bytes.fromhex(encrypted_data.hex()))
 
-            except Exception as e:
+            except Exception:
                 decrypted_message = self.decrypt_mtproto2(bytes.fromhex(message_key.hex()), message.chat_id,
                                                           bytes.fromhex(encrypted_data.hex()))
                 peer.mtproto = 2
                 self._log.debug(f"Used MTProto 2 with chat {message.chat_id}")
+
         peer.ttr -= 1
         if (peer.ttr <= 0 or (time() - peer.updated) > 7 * 24 * 60 * 60) and peer.rekeying[0] == 0:
             await self.rekey(peer)
+
         peer.incoming[peer.in_seq_no] = message
         return await self.handle_decrypted_message(decrypted_message, peer)
 
@@ -307,11 +320,13 @@ class SecretChatMethods:
         if peer.layer > 8:
             if (peer.ttr <= 0 or (time() - peer.updated) > 7 * 24 * 60 * 60) and peer.rekeying[0] == 0:
                 await self.rekey(peer)
-            message = types.secret.DecryptedMessageLayer(layer=peer.layer,
-                                            random_bytes=os.urandom(15 + 4 * random.randint(0, 2)),
-                                            in_seq_no=self.generate_secret_in_seq_no(peer.id),
-                                            out_seq_no=self.generate_secret_out_seq_no(peer.id),
-                                            message=message)
+            message = types.secret.DecryptedMessageLayer(
+                layer=peer.layer,
+                random_bytes=os.urandom(15 + 4 * random.randint(0, 2)),
+                in_seq_no=self.generate_secret_in_seq_no(peer.id),
+                out_seq_no=self.generate_secret_out_seq_no(peer.id),
+                message=message
+            )
 
             peer.out_seq_no += 1
 
@@ -322,6 +337,7 @@ class SecretChatMethods:
             padding = (16 - len(message) % 16) % 16
             if padding < 12:
                 padding += 16
+
             message += os.urandom(padding)
             is_admin = (0 if peer.admin else 8)
             first_str = peer.key.auth_key[88 + is_admin:88 + 32 + is_admin]
@@ -334,9 +350,10 @@ class SecretChatMethods:
                                                          True)
             padding = (16 - len(message) % 16) % 16
             message += os.urandom(padding)
-        message = struct.pack('<q', peer.key.fingerprint) + message_key + AES.encrypt_ige(bytes.fromhex(message.hex()),
-                                                                                          aes_key,
-                                                                                          aes_iv)
+
+        message = struct.pack('<q', peer.key.fingerprint) + message_key + AES.encrypt_ige(
+            bytes.fromhex(message.hex()), aes_key, aes_iv)
+
         return message
 
     async def send_secret_message(
@@ -352,10 +369,10 @@ class SecretChatMethods:
             message = types.secret.DecryptedMessage46(ttl, message, reply_to_random_id=reply_to_id)
         else:
             message = types.secret.DecryptedMessage(ttl, message, reply_to_random_id=reply_to_id)
+
         data = await self.encrypt_secret_message(peer_id, message)
-        res = await self(
+        return await self(
             functions.messages.SendEncryptedRequest(peer=peer.input_chat, data=data))
-        return res
 
     async def notify_layer(self: 'TelegramClient', peer: hints.EntityLike):
         if isinstance(peer, int):
@@ -364,15 +381,15 @@ class SecretChatMethods:
             peer = self.secret_chats[peer.id]
         if peer.layer == 8:
             return
+
         message = types.secret.DecryptedMessageService8(action=types.secret.DecryptedMessageActionNotifyLayer(
             layer=min(DEFAULT_LAYER, peer.layer)), random_bytes=os.urandom(15 + 4 * random.randint(0, 2)))
+
         data = await self.encrypt_secret_message(peer.id, message)
         return await self(
-            functions.messages.SendEncryptedServiceRequest(peer=types.InputEncryptedChat(peer.id, peer.access_hash),
-                                        data=data))
+            functions.messages.SendEncryptedServiceRequest(peer=peer.as_input(), data=data))
 
     async def close_secret_chat(self: 'TelegramClient', peer: Chats):
-
         if self.secret_chats.get(peer.id, None):
             del self.secret_chats[peer]
         if self.temp_secret_chat.get(peer.id, None):
@@ -394,6 +411,7 @@ class SecretChatMethods:
         message_data = decrypted_data[4:message_data_length + 4]
         if message_data_length > len(decrypted_data):
             raise SecurityError("message data length is too big")
+
         is_admin = peer.admin
         first_str = peer.key.auth_key[88 + is_admin:88 + 32 + is_admin]
 
@@ -407,9 +425,9 @@ class SecretChatMethods:
         return BinaryReader(message_data).tgread_object()
 
     def decrypt_mtproto1(self: 'TelegramClient', message_key: bytes, chat_id: int, encrypted_data: bytes):
-        aes_key, aes_iv = MTProtoState._old_calc_key(self.secret_chats[chat_id].key.auth_key,
-                                                     message_key,
-                                                     True)
+        aes_key, aes_iv = MTProtoState._old_calc_key(
+            self.secret_chats[chat_id].key.auth_key, message_key, True)
+
         decrypted_data = AES.decrypt_ige(encrypted_data, aes_key, aes_iv)
         message_data_length = struct.unpack('<I', decrypted_data[:4])[0]
         message_data = decrypted_data[4:message_data_length + 4]
@@ -428,6 +446,7 @@ class SecretChatMethods:
     async def accept_secret_chat(self: 'TelegramClient', chat: 'types.TypeEncryptedChat'):
         if chat.id == 0:
             raise ValueError("Already accepted")
+
         dh_config = await self.get_dh_config()
         random_bytes = os.urandom(256)
         b = int.from_bytes(random_bytes, byteorder="big", signed=False)
@@ -442,9 +461,11 @@ class SecretChatMethods:
         self.secret_chats[chat.id] = secret_chat
         g_b = pow(dh_config.g, b, dh_config.p)
         self.check_g_a(g_b, dh_config.p)
-        result = await self(
-            functions.messages.AcceptEncryptionRequest(input_peer, g_b=g_b.to_bytes(256, 'big', signed=False),
-                                    key_fingerprint=key.fingerprint))
+        result = await self(functions.messages.AcceptEncryptionRequest(
+            peer=input_peer,
+            g_b=g_b.to_bytes(256, 'big', signed=False),
+            key_fingerprint=key.fingerprint)
+        )
         await self.notify_layer(chat)
         return result
 
@@ -458,6 +479,7 @@ class SecretChatMethods:
         key.fingerprint = struct.unpack('<q', sha1(key.auth_key).digest()[-8:])[0]
         if key.fingerprint != chat.key_fingerprint:
             raise ValueError("Wrong fingerprint")
+
         key.visualization_orig = sha1(key.auth_key).digest()[16:]
         key.visualization_46 = sha256(key.auth_key).digest()[20:]
         input_peer = types.InputEncryptedChat(chat_id=chat.id, access_hash=chat.access_hash)
